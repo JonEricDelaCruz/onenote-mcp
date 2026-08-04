@@ -1,0 +1,71 @@
+{
+  "name": "@joneericdelacruz/onenote-mcp",
+  "version": "2.0.0",
+  "description": "Read, search, and write your Microsoft OneNote notebooks from Claude, Cursor, and other AI apps.",
+  "type": "module",
+  "license": "MIT",
+  "main": "onenote-mcp.mjs",
+  "bin": {
+    "onenote-mcp": "onenote-mcp.mjs",
+    "onenote-cli": "onenote-cli.mjs"
+  },
+  "engines": {
+    "node": ">=20.10.0"
+  },
+  "files": [
+    "onenote-mcp.mjs",
+    "onenote-cli.mjs",
+    "src/",
+    "manifest.json",
+    "icon.png",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node onenote-mcp.mjs",
+    "auth": "node onenote-cli.mjs auth",
+    "status": "node onenote-cli.mjs status",
+    "signout": "node onenote-cli.mjs signout",
+    "cli": "node onenote-cli.mjs",
+    "test": "node --test --test-timeout=40000 \"test/*.test.mjs\"",
+    "check": "node --check onenote-mcp.mjs && node --check onenote-cli.mjs",
+    "audit": "npm audit --audit-level=high",
+    "bundle": "node scripts/build-bundle.mjs",
+    "setup": "node onenote-cli.mjs setup",
+    "doctor": "node onenote-cli.mjs doctor"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^5.4.3",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "open": "^10.2.0",
+    "zod": "^4.4.3"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "onenote",
+    "microsoft-graph",
+    "claude",
+    "cursor",
+    "notes"
+  ],
+  "contributors": [
+    "Zubeid Hendricks (original azure-onenote-mcp-server)",
+    "danosb (onenote-mcp)"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/JonEricDelaCruz/onenote-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/JonEricDelaCruz/onenote-mcp/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "author": {
+    "name": "Jon Eric Dela Cruz",
+    "url": "https://jonericdelacruz.com"
+  }
+}

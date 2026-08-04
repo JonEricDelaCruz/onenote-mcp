@@ -1,0 +1,130 @@
+name: Release
+
+# Tag a version and this builds the one-click bundle, attaches it to the
+# GitHub release, and (optionally) publishes to npm.
+#
+#   npm version minor          # bumps package.json and creates the tag
+#   # bump "version" in manifest.json to match, commit it
+#   git push --follow-tags
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      publish_npm:
+        description: 'Also publish to npm'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build bundle
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - run: npm ci
+
+      - name: Test before shipping
+        run: npm test
+
+      - name: Read version
+        id: meta
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      # The build script refuses to run if package.json and manifest.json
+      # disagree, and refuses to emit an artifact containing .env, credentials,
+      # or test files.
+      - name: Build .mcpb bundle
+        run: npm run bundle
+
+      - name: Checksum
+        run: |
+          cd dist
+          sha256sum *.mcpb > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mcpb-bundle
+          path: dist/*
+
+  release:
+    name: Attach to release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: mcpb-bundle
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.mcpb
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **Claude Desktop** — download `onenote-mcp-${{ needs.build.outputs.version }}.mcpb`
+            below and double-click it. Nothing else to install.
+
+            **Cursor, Windsurf, and others** — add this to your MCP config:
+
+            ```json
+            {
+              "mcpServers": {
+                "onenote": {
+                  "command": "npx",
+                  "args": ["-y", "@joneericdelacruz/onenote-mcp"]
+                }
+              }
+            }
+            ```
+
+            Then ask your assistant to list your OneNote notebooks. It will walk
+            you through signing in to Microsoft.
+
+            Verify your download against `SHA256SUMS.txt`.
+
+  npm:
+    name: Publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/') || inputs.publish_npm
+    environment: npm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          cache: npm
+
+      - run: npm ci
+
+      # Provenance ties the published package to this workflow run, so users can
+      # verify it was built from this repository.
+      - name: Publish
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

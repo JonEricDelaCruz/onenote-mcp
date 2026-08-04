@@ -1,0 +1,181 @@
+{
+  "manifest_version": "0.2",
+  "name": "onenote-mcp",
+  "display_name": "OneNote for Claude",
+  "version": "2.0.0",
+  "description": "Read, search, and write your Microsoft OneNote notebooks from Claude.",
+  "long_description": "Connects Claude to your Microsoft OneNote notebooks.\n\nAsk Claude to find a note, summarize a page, pull action items out of meeting notes, or write a new page for you \u2014 without leaving the conversation.\n\n**What it can do**\n- Search your notes by title or full text\n- Read any page, with formatting preserved as readable text\n- See your whole notebook structure in one step, including section groups\n- Create new pages and append to existing ones\n- Organize notes into new sections\n\n**Where your notes go**\n\nStraight from Microsoft to your own computer, and then into your conversation. Nothing passes through any third-party server \u2014 there is no server. No analytics, no telemetry, no tracking of any kind. The author of this extension receives nothing: not your notes, not your email, not even a count of how often you use it.\n\n**What it can access**\n\nOnly notebooks you own, in your own account. Not notebooks shared with you, not group notebooks, and not password-protected sections \u2014 Microsoft blocks those outright. It cannot see your email, calendar, contacts, or files.\n\nPages are fetched only when you ask about them \u2014 never in bulk, never indexed. No note content is ever written to disk. When you search inside your notes, the pages read are kept in memory for 60 seconds so follow-up questions are fast; that cache never leaves the process and vanishes when you quit.\n\n**Turning off writing**\n\nSwitch off \"Allow Claude to change your notes\" below and it becomes read-only. For a stronger guarantee, set permissions to 'Notes.Read offline_access' and Microsoft itself will refuse any write.\n\n**Full details**\n\nEvery permission is explained line by line, with instructions for verifying the claims yourself, in PRIVACY.md in the project repository.\n\n**Signing in**\n\nAfter installing, just ask Claude to list your notebooks. A browser window opens for you to sign in to Microsoft. That happens once.",
+  "author": {
+    "name": "Jon Eric Dela Cruz",
+    "url": "https://jonericdelacruz.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/JonEricDelaCruz/onenote-mcp"
+  },
+  "homepage": "https://github.com/JonEricDelaCruz/onenote-mcp",
+  "documentation": "https://github.com/JonEricDelaCruz/onenote-mcp#readme",
+  "support": "https://github.com/JonEricDelaCruz/onenote-mcp/issues",
+  "icon": "icon.png",
+  "license": "MIT",
+  "keywords": [
+    "onenote",
+    "notes",
+    "microsoft",
+    "notebook",
+    "productivity",
+    "search"
+  ],
+  "server": {
+    "type": "node",
+    "entry_point": "onenote-mcp.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": [
+        "${__dirname}/onenote-mcp.mjs"
+      ],
+      "env": {
+        "ONENOTE_CLIENT_ID": "${user_config.client_id}",
+        "ONENOTE_TENANT_ID": "${user_config.tenant_id}",
+        "ONENOTE_ALLOW_WRITE": "${user_config.allow_write}",
+        "ONENOTE_SCOPES": "${user_config.scopes}",
+        "ONENOTE_DEFAULT_SECTION": "${user_config.default_section}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "getOutline",
+      "description": "See all notebooks and sections in one step"
+    },
+    {
+      "name": "authStatus",
+      "description": "Check whether you are signed in to Microsoft"
+    },
+    {
+      "name": "authenticate",
+      "description": "Sign in to your Microsoft account"
+    },
+    {
+      "name": "signOut",
+      "description": "Sign out and clear saved credentials"
+    },
+    {
+      "name": "listNotebooks",
+      "description": "List your OneNote notebooks"
+    },
+    {
+      "name": "listSections",
+      "description": "List sections, optionally within one notebook"
+    },
+    {
+      "name": "listPages",
+      "description": "List pages, optionally within one section"
+    },
+    {
+      "name": "getPage",
+      "description": "Read the full content of a page"
+    },
+    {
+      "name": "searchPages",
+      "description": "Search your notes by title or content"
+    },
+    {
+      "name": "createPage",
+      "description": "Create a new page in a section"
+    },
+    {
+      "name": "appendToPage",
+      "description": "Add content to an existing page"
+    },
+    {
+      "name": "createSection",
+      "description": "Create a new section in a notebook"
+    },
+    {
+      "name": "deletePage",
+      "description": "Delete a page, with title confirmation required"
+    }
+  ],
+  "tools_generated": false,
+  "prompts": [
+    {
+      "name": "summarize_recent_notes",
+      "description": "Summarize what you have written recently",
+      "arguments": [
+        "count"
+      ],
+      "text": "Look at my ${arguments.count} most recently modified OneNote pages using listPages, read each one with getPage, and give me a short summary of what I have been working on. Group related notes together."
+    },
+    {
+      "name": "find_action_items",
+      "description": "Pull action items out of your notes",
+      "arguments": [
+        "topic"
+      ],
+      "text": "Search my OneNote for pages about \"${arguments.topic}\" using searchPages with searchContent enabled. Read the matching pages and extract every action item, task, or commitment you find. Present them as a checklist, noting which page each came from."
+    },
+    {
+      "name": "daily_note",
+      "description": "Create a note for today",
+      "arguments": [
+        "section",
+        "content"
+      ],
+      "text": "Create a new OneNote page in the \"${arguments.section}\" section, titled with today's date. Include this content, formatted clearly: ${arguments.content}"
+    }
+  ],
+  "prompts_generated": false,
+  "user_config": {
+    "default_section": {
+      "type": "string",
+      "title": "Default section for new notes",
+      "description": "Optional. Name of the section new pages should go to when you do not say where (e.g. \"Ideas\" or \"Learn / Cooking\"). Leave blank to be asked each time.",
+      "required": false,
+      "default": ""
+    },
+    "allow_write": {
+      "type": "boolean",
+      "title": "Allow Claude to change your notes",
+      "description": "When on, Claude can create pages, add to existing pages, and delete pages. Turn this off to make the connection read-only.",
+      "required": false,
+      "default": true
+    },
+    "client_id": {
+      "type": "string",
+      "title": "Microsoft application ID",
+      "description": "Leave blank to use the built-in application. Only fill this in if your organization requires you to use your own Microsoft app registration \u2014 paste the Application (client) ID here.",
+      "required": false,
+      "sensitive": false,
+      "default": ""
+    },
+    "tenant_id": {
+      "type": "string",
+      "title": "Microsoft account type",
+      "description": "Leave as 'common' unless your IT department told you otherwise. Use 'consumers' for personal Microsoft accounts only, 'organizations' for work or school accounts only, or paste your organization's tenant ID.",
+      "required": false,
+      "default": "common"
+    },
+    "scopes": {
+      "type": "string",
+      "title": "Permissions requested from Microsoft",
+      "description": "Advanced. Leave as-is unless you know you need more. The default covers only your own notebooks. Use 'Notes.ReadWrite.All offline_access' to also reach notebooks shared with you and group notebooks.",
+      "required": false,
+      "default": "Notes.ReadWrite offline_access"
+    }
+  },
+  "compatibility": {
+    "claude_desktop": ">=0.10.0",
+    "platforms": [
+      "darwin",
+      "win32",
+      "linux"
+    ],
+    "runtimes": {
+      "node": ">=20.10.0"
+    }
+  },
+  "privacy_policies": [
+    "https://github.com/JonEricDelaCruz/onenote-mcp/blob/main/PRIVACY.md"
+  ]
+}

@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # Weekly, so a newly-disclosed advisory in a dependency surfaces without
+    # waiting for the next commit.
+    - cron: '0 9 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }} / ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: ['20', '22', '24']
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      # Uses the lockfile exactly. This is the check that would have caught the
+      # v1 breakage where package.json referenced a local SDK checkout that npm
+      # could not resolve.
+      - name: Install from lockfile
+        run: npm ci
+
+      - name: Syntax check
+        run: npm run check
+
+      - name: Test
+        run: npm test
+
+  bundle:
+    name: Bundle builds and is clean
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      # Fails if package.json and manifest.json versions disagree, or if the
+      # artifact would contain .env, credentials, tests, or CI config.
+      - name: Build .mcpb
+        run: npm run bundle
+
+      - name: Confirm the bundle runs standalone
+        run: |
+          mkdir -p /tmp/unpacked
+          npx --yes --package=@anthropic-ai/mcpb mcpb unpack dist/*.mcpb /tmp/unpacked
+          cd /tmp/unpacked
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"ci","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}}}' \
+            | ONENOTE_CLIENT_ID=3f9a21c4-8e7b-4d12-9c55-1a2b3c4d5e6f timeout 20 node onenote-mcp.mjs 2>/dev/null \
+            | grep -q '"listNotebooks"' && echo "Bundle responds correctly"
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: npm ci
+
+      - name: Fail on high or critical advisories
+        run: npm audit --audit-level=high
+
+      - name: Report install scripts in the dependency tree
+        # Packages with lifecycle scripts run arbitrary code at install time.
+        # This project expects zero; surface it if that ever changes.
+        run: |
+          count=$(grep -c '"hasInstallScript": *true' package-lock.json || true)
+          echo "Packages with install scripts: ${count:-0}"
+          if [ "${count:-0}" -gt 0 ]; then
+            echo "::warning::Dependency tree now contains packages with install scripts. Review them."
+            grep -B4 '"hasInstallScript": *true' package-lock.json || true
+          fi
+
+  secrets:
+    name: Committed secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cheap, dependency-free guard against the two mistakes this project is
+      # most likely to make: committing a token cache, or reintroducing the
+      # borrowed Microsoft first-party client ID.
+      - name: Check for committed credentials
+        run: |
+          set -e
+          fail=0
+
+          for pattern in '.access-token.txt' 'token-cache.json' '.env'; do
+            if git ls-files --error-unmatch "$pattern" >/dev/null 2>&1; then
+              echo "::error::$pattern is tracked by git and must not be committed."
+              fail=1
+            fi
+          done
+
+          # The borrowed Microsoft first-party client ID is legitimately present
+          # in src/config.mjs (as a blocklist entry) and in the tests that prove
+          # it is rejected. Anywhere else means someone reintroduced it for real.
+          if git grep -qiI '14d82eec-204b-4c2f-b7e8-296a70dab67e' \
+               -- ':!test' ':!*.md' ':!src/config.mjs' ':!.github'; then
+            echo "::error::Borrowed Microsoft first-party client ID used outside its blocklist entry."
+            git grep -niI '14d82eec-204b-4c2f-b7e8-296a70dab67e' \
+              -- ':!test' ':!*.md' ':!src/config.mjs' ':!.github'
+            fail=1
+          fi
+
+          # A real bundled client ID is fine and expected; the Microsoft one is not.
+          if grep -qiE "^export const BUNDLED_CLIENT_ID = '14d82eec" src/config.mjs; then
+            echo "::error::BUNDLED_CLIENT_ID is set to the Microsoft first-party app."
+            fail=1
+          fi
+
+          # Bearer tokens and MSAL refresh tokens have recognisable prefixes.
+          # .github is excluded because this very pattern lives here.
+          if git grep -qIE 'eyJ0eXAiOiJKV1Q|0\.A[A-Za-z0-9_-]{40,}' \
+               -- ':!package-lock.json' ':!.github'; then
+            echo "::error::What looks like a JWT or refresh token is committed."
+            git grep -nIE 'eyJ0eXAiOiJKV1Q|0\.A[A-Za-z0-9_-]{40,}' \
+              -- ':!package-lock.json' ':!.github'
+            fail=1
+          fi
+
+          exit $fail

@@ -1,0 +1,72 @@
+# Dependency directories
+node_modules/
+jspm_packages/
+
+# Build outputs
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Packed extension bundles are release artifacts, built by CI, never committed
+*.mcpb
+
+# Environment variables and secrets
+#
+# Credentials now live in the OS config directory, not the repo. The legacy
+# entries below stay so that anyone upgrading from v1 cannot accidentally commit
+# a token file left behind by the old implementation.
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+.access-token.txt
+token-cache.json
+*.token-cache.json
+
+# The local MCP SDK checkout the v1 setup instructions told you to clone.
+# No longer used -- the SDK comes from npm.
+typescript-sdk/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# Cache and temp files
+.npm
+.eslintcache
+.cache
+.parcel-cache
+.rpt2_cache/
+.rts2_cache_cjs/
+.rts2_cache_es/
+.rts2_cache_umd/ 
+# Personal launch notes — never publish
+LAUNCH.md
+START-HERE.md
