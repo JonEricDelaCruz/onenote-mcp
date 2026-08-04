@@ -169,9 +169,25 @@ describe('client locations', () => {
   });
 
   test('Claude Desktop uses the documented per-OS locations', () => {
-    assert.match(configPathFor('claude-desktop', 'darwin'), /Library\/Application Support\/Claude\//);
-    assert.match(configPathFor('claude-desktop', 'win32'), /Claude/);
-    assert.match(configPathFor('claude-desktop', 'darwin'), /claude_desktop_config\.json$/);
+    // Assert on path SEGMENTS, not separators. These paths are built with
+    // path.join, which emits backslashes when the test itself runs on Windows —
+    // so a regex containing "/" passes on macOS and Linux and fails on Windows.
+    // That is exactly how this suite went red on windows-latest while staying
+    // green everywhere else.
+    const segmentsOf = (p) => p.split(/[/\\]/);
+
+    const mac = segmentsOf(configPathFor('claude-desktop', 'darwin'));
+    assert.ok(mac.includes('Library'), 'macOS path should live under Library');
+    assert.ok(mac.includes('Application Support'), 'macOS path should use Application Support');
+    assert.ok(mac.includes('Claude'), 'macOS path should be inside a Claude folder');
+    assert.equal(mac[mac.length - 1], 'claude_desktop_config.json');
+
+    const win = segmentsOf(configPathFor('claude-desktop', 'win32'));
+    assert.ok(win.includes('Claude'));
+    assert.equal(win[win.length - 1], 'claude_desktop_config.json');
+
+    const linux = segmentsOf(configPathFor('claude-desktop', 'linux'));
+    assert.equal(linux[linux.length - 1], 'claude_desktop_config.json');
   });
 
   test('unknown clients resolve to null rather than throwing', () => {
