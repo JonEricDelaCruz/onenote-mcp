@@ -195,7 +195,7 @@ describe('2026-07-28 stateless era', () => {
     const { tools } = responses.find((r) => r.id === 1).result;
     const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
 
-    assert.deepEqual(byName.getPage.inputSchema.required, ['pageId']);
+    assert.deepEqual(byName.getPage.inputSchema.required, ['page']);
     assert.ok(byName.searchPages.inputSchema.required.includes('query'));
     assert.ok(byName.createPage.inputSchema.required.includes('title'));
   });
@@ -403,5 +403,62 @@ describe('token efficiency', () => {
       /default/i,
       'the cap should be documented so the model knows it can ask for more'
     );
+  });
+});
+
+describe('pages are addressable by title', () => {
+  /**
+   * Regression guard for a real failure: page IDs were removed from tool output
+   * text during token-efficiency work, on the assumption that callers would read
+   * them from structuredContent. MCP clients surface only the text to the model,
+   * so the assistant saw a title in search results, passed it to getPage, and was
+   * told it was an invalid ID. Titles must be first-class inputs.
+   */
+  test('getPage takes a title, not only an ID', async () => {
+    const { responses } = await converse([
+      { jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: MODERN_META } }
+    ]);
+    const byName = Object.fromEntries(
+      responses.find((r) => r.id === 1).result.tools.map((t) => [t.name, t])
+    );
+
+    const props = byName.getPage.inputSchema.properties;
+    assert.ok(props.page, 'getPage should accept `page`');
+    assert.ok(!props.pageId, 'the ID-only argument should be gone');
+    assert.match(props.page.description, /title/i, 'the schema must advertise title support');
+    assert.deepEqual(byName.getPage.inputSchema.required, ['page']);
+  });
+
+  test('every page-taking tool accepts a title', async () => {
+    const { responses } = await converse([
+      { jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: MODERN_META } }
+    ]);
+    const byName = Object.fromEntries(
+      responses.find((r) => r.id === 1).result.tools.map((t) => [t.name, t])
+    );
+
+    for (const tool of ['getPage', 'appendToPage', 'deletePage']) {
+      const props = byName[tool].inputSchema.properties;
+      assert.ok(props.page, `${tool} should accept \`page\``);
+      assert.ok(!props.pageId, `${tool} should not require a raw ID`);
+    }
+  });
+
+  test('the model is told it can skip ID lookups', async () => {
+    const { responses } = await converse([
+      {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {
+          protocolVersion: '2025-06-18',
+          capabilities: {},
+          clientInfo: { name: 'c', version: '1' }
+        }
+      }
+    ]);
+    const instructions = responses.find((r) => r.id === 1)?.result?.instructions ?? '';
+    assert.match(instructions, /page TITLES/i);
+    assert.match(instructions, /never need to look up an ID/i);
   });
 });

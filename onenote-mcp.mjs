@@ -142,7 +142,14 @@ const SectionRef = z
       'case-insensitively; if several match you get the list back to choose from.'
   );
 
-const PageId = z.string().min(1).describe('Page ID from listPages or searchPages.');
+const PageRef = z
+  .string()
+  .min(1)
+  .describe(
+    'Page TITLE (e.g. "AI Search") or ID. Titles are matched case-insensitively; ' +
+      'if several pages share one you get the list back to choose from. You do NOT ' +
+      'need to look up an ID first.'
+  );
 
 const Limit = z
   .number()
@@ -180,9 +187,11 @@ function createServer() {
         'EFFICIENCY -- do not crawl the hierarchy:\n' +
         '- To see what exists, call `getOutline` ONCE. It returns every notebook, section group, ' +
         'and section with IDs and readable paths. Do not chain listNotebooks -> listSections.\n' +
-        '- Tools accept section NAMES directly ("Ideas", "Learn / Cooking"). You almost never ' +
-        'need to look up an ID first.\n' +
-        '- To find content, call `searchPages` directly. Add `section` to narrow it.\n' +
+        '- Tools accept section NAMES and page TITLES directly ("Ideas", "Learn / Cooking", ' +
+        '"AI Search"). You never need to look up an ID first — pass the name straight through ' +
+        'from what searchPages or getOutline showed you.\n' +
+        '- To find content, call `searchPages` directly, then pass a matching title straight to ' +
+        '`getPage`. Add `section` to narrow either one.\n' +
         '- Reserve `listNotebooks` / `listSections` for when the user explicitly asks to browse.\n\n' +
         'Note that sections often live inside section groups; `getOutline` shows that nesting, ' +
         'and every tool handles it transparently.'
@@ -535,7 +544,10 @@ function createServer() {
         'Read one page by ID. Returns readable text by default; pass format="html" for the raw ' +
         'XHTML, and includeIds=true if you intend to modify the page afterwards.',
       inputSchema: z.object({
-        pageId: PageId,
+        page: PageRef,
+        section: SectionRef.optional().describe(
+          'Optional: narrow to one section when several pages share a title.'
+        ),
         format: z
           .enum(['text', 'html'])
           .optional()
@@ -557,9 +569,9 @@ function createServer() {
       }),
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
-    handler(async ({ pageId, format, includeIds, maxLength }) => {
-      const meta = await onenote.getPageMetadata(pageId);
-      const { content, format: actual } = await onenote.getPageContent(pageId, {
+    handler(async ({ page, section, format, includeIds, maxLength }) => {
+      const meta = (await onenote.resolvePage(page, { section })).page;
+      const { content, format: actual } = await onenote.getPageContent(meta.id, {
         format: format ?? 'text',
         includeIds: includeIds ?? false
       });
@@ -708,7 +720,7 @@ function createServer() {
       title: 'Append to page',
       description: 'Add content to the end (or start) of an existing page without replacing it.',
       inputSchema: z.object({
-        pageId: PageId,
+        page: PageRef,
         content: z.string().min(1).describe('Content to add. Plain text unless isHtml is true.'),
         isHtml: z.boolean().optional(),
         position: z
@@ -718,16 +730,18 @@ function createServer() {
       }),
       annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true }
     },
-    handler(async ({ pageId, content, isHtml, position }) => {
+    handler(async ({ page, content, isHtml, position }) => {
+      const target = (await onenote.resolvePage(page)).page;
       const result = await onenote.appendToPage({
-        pageId,
+        pageId: target.id,
         content,
         isHtml: isHtml ?? false,
         position: position ?? 'append'
       });
       return ok(
-        `Content ${result.position === 'prepend' ? 'prepended to' : 'appended to'} page.`,
-        result
+        `Content ${result.position === 'prepend' ? 'prepended to' : 'appended to'} ` +
+          `"${target.title}"${target.sectionName ? ` (${target.sectionName})` : ''}.`,
+        { ...result, title: target.title }
       );
     })
   );
@@ -757,7 +771,7 @@ function createServer() {
         'Permanently delete a page. This cannot be undone -- confirm the page title with the user ' +
         'before calling.',
       inputSchema: z.object({
-        pageId: PageId,
+        page: PageRef,
         confirmTitle: z
           .string()
           .min(1)
@@ -767,8 +781,8 @@ function createServer() {
       }),
       annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
     },
-    handler(async ({ pageId, confirmTitle }) => {
-      const meta = await onenote.getPageMetadata(pageId);
+    handler(async ({ page, confirmTitle }) => {
+      const meta = (await onenote.resolvePage(page)).page;
       const actual = (meta.title || '').trim();
       if (actual.toLowerCase() !== confirmTitle.trim().toLowerCase()) {
         return fail(
@@ -776,7 +790,7 @@ function createServer() {
             'Re-read the page and confirm the exact title with the user.'
         );
       }
-      const result = await onenote.deletePage(pageId);
+      const result = await onenote.deletePage(meta.id);
       return ok(`Deleted page "${actual}".`, result);
     })
   );

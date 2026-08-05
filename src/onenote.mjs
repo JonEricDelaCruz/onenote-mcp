@@ -372,6 +372,63 @@ export class OneNoteClient {
     );
   }
 
+  /**
+   * Turn a page title into a page.
+   *
+   * This exists because of a real failure: page IDs were removed from tool
+   * output text to save tokens, on the assumption that callers would read them
+   * from `structuredContent`. MCP clients generally surface only the text to the
+   * model, so the assistant could see "AI Search" in search results and had no
+   * ID to pass to getPage -- it would send the title, which was rejected.
+   *
+   * Rather than push ~50-character IDs back into every line of prose, pages are
+   * now addressable the same way sections are: by name.
+   *
+   * @param {string} titleOrId
+   * @param {object} [options]
+   * @param {string} [options.section] Narrow the search to one section.
+   */
+  async resolvePage(titleOrId, { section } = {}) {
+    const query = String(titleOrId ?? '').trim();
+    if (!query) throw new GraphError('A page title or ID is required.', { status: 400 });
+
+    // OneNote page IDs have a distinctive shape; try an exact ID hit first so a
+    // genuine ID never pays for a listing.
+    if (/^[0-9a-zA-Z]+-[0-9A-Fa-f!]/.test(query) && query.includes('!')) {
+      try {
+        const direct = await this.getPageMetadata(query);
+        if (direct?.id) return { page: direct, matched: 'id' };
+      } catch {
+        // Not an ID after all; fall through to title matching.
+      }
+    }
+
+    const pages = await this.listPages({ section, limit: 200 });
+
+    const byId = pages.find((p) => p.id === query);
+    if (byId) return { page: byId, matched: 'id' };
+
+    const lower = query.toLowerCase();
+
+    const exact = pages.filter((p) => (p.title || '').toLowerCase() === lower);
+    if (exact.length === 1) return { page: exact[0], matched: 'title' };
+    if (exact.length > 1) throw ambiguousPage(query, exact);
+
+    const partial = pages.filter((p) => (p.title || '').toLowerCase().includes(lower));
+    if (partial.length === 1) return { page: partial[0], matched: 'partial' };
+    if (partial.length > 1) throw ambiguousPage(query, partial);
+
+    throw new GraphError(
+      `No page matches "${query}"${section ? ` in section "${section}"` : ''}.\n\n` +
+        'Use searchPages to find it, or listPages to browse. Recent pages:\n' +
+        pages
+          .slice(0, 15)
+          .map((p) => `  - ${p.title || '(untitled)'}${p.sectionName ? ` (${p.sectionName})` : ''}`)
+          .join('\n'),
+      { status: 404 }
+    );
+  }
+
   /** Same idea for notebooks. */
   async resolveNotebook(nameOrId) {
     const query = String(nameOrId ?? '').trim();
@@ -700,6 +757,23 @@ function shapeSection(section) {
     createdDateTime: section.createdDateTime,
     lastModifiedDateTime: section.lastModifiedDateTime
   };
+}
+
+function ambiguousPage(query, matches) {
+  return new GraphError(
+    `"${query}" matches ${matches.length} pages:\n` +
+      matches
+        .slice(0, 15)
+        .map(
+          (p) =>
+            `  - ${p.title || '(untitled)'}` +
+            `${p.sectionName ? ` (in ${p.sectionName})` : ''}` +
+            `${p.lastModifiedDateTime ? ` — modified ${p.lastModifiedDateTime.slice(0, 10)}` : ''}`
+        )
+        .join('\n') +
+      '\n\nNarrow it with the `section` argument, or give the full exact title.',
+    { status: 400, code: 'ambiguousPage' }
+  );
 }
 
 /** Ambiguity is surfaced with the candidates, so the user can just pick one. */
