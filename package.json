@@ -1,6 +1,6 @@
 {
   "name": "@joneericdelacruz/onenote-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Read, search, and write your Microsoft OneNote notebooks from Claude, Cursor, and other AI apps.",
   "type": "module",
   "license": "MIT",

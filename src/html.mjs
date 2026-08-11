@@ -89,8 +89,30 @@ function walk(node, out, ctx) {
     }
 
     if (tag === 'IMG') {
-      const alt = child.getAttribute('alt');
-      out.push(alt ? `[image: ${alt}]` : '[image]');
+      // OneNote renders PDF printouts as page images, flagged with
+      // data-options="printout". Naming that explicitly matters: the assistant
+      // should tell the user "this is a scanned page I cannot read" rather than
+      // silently omitting it.
+      const alt = (child.getAttribute('alt') || '').trim();
+      const printout = (child.getAttribute('data-options') || '').includes('printout');
+
+      if (alt) {
+        out.push(`\n[Image: ${alt}]\n`);
+      } else if (printout) {
+        out.push('\n[PDF page image. Microsoft does not expose its text through the API.]\n');
+      } else {
+        out.push('\n[Image with no caption. Any text inside it is not available through the API.]\n');
+      }
+      continue;
+    }
+
+    if (tag === 'OBJECT') {
+      // Embedded files were previously invisible: <object> has no children, so
+      // the walker produced nothing and a page with an attached PDF looked
+      // empty at that point.
+      const name = child.getAttribute('data-attachment') || 'attachment';
+      const type = child.getAttribute('type') || '';
+      out.push(`\n[Attachment: ${name}${type ? ` (${type})` : ''}]\n`);
       continue;
     }
 
@@ -216,4 +238,43 @@ export function escapeHtml(value) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/**
+ * List the embedded resources on a page, so the caller can decide whether to
+ * fetch any of them.
+ *
+ * The page HTML only ever contains a filename and a download endpoint for an
+ * attachment. Reading the document itself requires a second request, which is
+ * the caller's decision to make: it costs time and bandwidth.
+ *
+ * @param {string} html
+ * @returns {{attachments: Array<{name: string, type: string, url: string}>,
+ *            images: Array<{alt: string, printout: boolean, url: string}>}}
+ */
+export function extractResources(html) {
+  const empty = { attachments: [], images: [] };
+  if (!html || typeof html !== 'string') return empty;
+
+  let root;
+  try {
+    root = parseHtml(html).body;
+  } catch {
+    return empty;
+  }
+  if (!root) return empty;
+
+  const attachments = root.querySelectorAll('object').map((node) => ({
+    name: node.getAttribute('data-attachment') || 'attachment',
+    type: node.getAttribute('type') || '',
+    url: node.getAttribute('data') || ''
+  }));
+
+  const images = root.querySelectorAll('img').map((node) => ({
+    alt: (node.getAttribute('alt') || '').trim(),
+    printout: (node.getAttribute('data-options') || '').includes('printout'),
+    url: node.getAttribute('data-fullres-src') || node.getAttribute('src') || ''
+  }));
+
+  return { attachments, images };
 }

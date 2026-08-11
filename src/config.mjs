@@ -85,6 +85,27 @@ function resolveCachePath(raw) {
   return path.join(base, 'onenote-mcp', 'token-cache.json');
 }
 
+/**
+ * Accept the three modes, and treat anything unrecognised as 'auto' rather than
+ * failing: a typo in a settings box should not stop the tool from starting.
+ */
+function normaliseImageMode(raw) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  return value === 'always' || value === 'never' ? value : 'auto';
+}
+
+/**
+ * 'disk'   remember extracted page text between sessions (default)
+ * 'memory' keep it only for the current session, write nothing down
+ * 'off'    no caching at all
+ *
+ * Same forgiving fallback: an unreadable value gets the default, not a crash.
+ */
+function normaliseCacheMode(raw) {
+  const value = String(raw ?? '').trim().toLowerCase();
+  return value === 'memory' || value === 'off' ? value : 'disk';
+}
+
 export class ConfigError extends Error {
   constructor(message) {
     super(message);
@@ -147,6 +168,30 @@ export function loadConfig(env = process.env) {
      * set, writes default here and the assistant can skip discovery entirely.
      */
     defaultSection: (env.ONENOTE_DEFAULT_SECTION || '').trim() || null,
+    /**
+     * When to send page images to the model: 'auto' | 'always' | 'never'.
+     *
+     * Images cost 1,300-4,000 tokens each, frequently more than the page they
+     * sit on, so sending them on every read taxes questions that never needed
+     * them. 'auto' sends them only when the page is mostly picture (its text is
+     * too thin to answer from), and otherwise announces that they exist so the
+     * user or the assistant can ask.
+     */
+    imageMode: normaliseImageMode(env.ONENOTE_IMAGE_MODE),
+    /**
+     * Whether extracted page text is remembered between sessions:
+     * 'disk' | 'memory' | 'off'.
+     *
+     * Re-reading an unchanged page costs a download, an extraction, and a full
+     * re-send of the text to the model. Keeping the extracted text locally
+     * removes the first two entirely. Entries are validated against the page's
+     * lastModifiedDateTime, so a cached copy is never staler than the metadata
+     * the caller already holds.
+     *
+     * The cache is per Microsoft account, stored beside the token cache at 0600,
+     * and never transmitted anywhere. See src/cache.mjs and PRIVACY.md.
+     */
+    cacheMode: normaliseCacheMode(env.ONENOTE_CACHE_MODE),
     graphBaseUrl: 'https://graph.microsoft.com/v1.0'
   };
 }

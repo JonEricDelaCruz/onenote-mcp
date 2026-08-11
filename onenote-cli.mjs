@@ -13,6 +13,7 @@
  *   onenote-cli auth                       Sign in
  *   onenote-cli status                     Show auth + config state
  *   onenote-cli signout                    Clear cached credentials
+ *   onenote-cli cache status|clear         Inspect or wipe remembered page text
  *   onenote-cli notebooks                  List notebooks
  *   onenote-cli sections [notebookId]      List sections
  *   onenote-cli pages [sectionId]          List pages
@@ -49,7 +50,9 @@ const USAGE = `onenote-cli v${version}
 
   auth                              Sign in to Microsoft
   status                            Show authentication and configuration state
-  signout                           Remove cached credentials
+  signout                           Remove cached credentials and cached pages
+  cache status                      Show what page text is remembered locally
+  cache clear                       Forget all remembered page text
   whoami                            Show the signed-in account
 
   notebooks                         List notebooks
@@ -242,7 +245,53 @@ async function main() {
 
     case 'signout': {
       const result = await auth.signOut();
+      // Signing out must leave nothing behind. Purge by pattern rather than by
+      // account: the tokens are already gone, so the account can no longer be
+      // resolved to find its own file.
+      const { purgeAllCaches } = await import('./src/cache.mjs');
+      const purged = await purgeAllCaches(config);
       out(result.signedOut ? 'Signed out and cleared token cache.' : 'No cached account found.');
+      if (purged.removed) out(`Removed ${purged.removed} cached page file(s).`);
+      return 0;
+    }
+
+    case 'cache': {
+      const action = (positional[1] || 'status').toLowerCase();
+      const { purgeAllCaches } = await import('./src/cache.mjs');
+
+      if (action === 'clear') {
+        const purged = await purgeAllCaches(config);
+        emit(flags, { cleared: true, files: purged.removed }, () =>
+          out(
+            purged.removed
+              ? `Cleared remembered page text (${purged.removed} file(s) removed).`
+              : 'Nothing cached.'
+          )
+        );
+        return 0;
+      }
+
+      if (action !== 'status') {
+        process.stderr.write(
+          `Unknown cache command "${action}". Use "status" or "clear".\n`
+        );
+        return 1;
+      }
+
+      const stats = await client.pageCache.stats();
+      emit(flags, { mode: config.cacheMode, ...stats }, () => {
+        out(`Mode:    ${config.cacheMode}`);
+        if (config.cacheMode !== 'disk') {
+          out('Nothing is written to disk in this mode.');
+          return;
+        }
+        out(`Pages:   ${stats.entries}`);
+        out(`Size:    ${(stats.bytes / 1024).toFixed(1)} KB of text`);
+        out(`File:    ${stats.path ?? '(not created yet)'}`);
+        out('');
+        out('This file never leaves your computer. Remove it with:');
+        out('  onenote-cli cache clear');
+      });
       return 0;
     }
 
@@ -303,7 +352,8 @@ async function main() {
       }
       const meta = await client.getPageMetadata(pageId);
       const { content, format } = await client.getPageContent(pageId, {
-        format: flags.html ? 'html' : 'text'
+        format: flags.html ? 'html' : 'text',
+        lastModified: meta.lastModifiedDateTime ?? null
       });
       emit(flags, { page: meta, format, content }, () => {
         out(`# ${meta.title || '(untitled)'}`);
@@ -347,7 +397,8 @@ async function main() {
       for (const page of pages) {
         try {
           const { content } = await client.getPageContent(page.id, {
-            format: flags.html ? 'html' : 'text'
+            format: flags.html ? 'html' : 'text',
+            lastModified: page.lastModifiedDateTime ?? null
           });
           collected.push({ ...page, content });
           if (!flags.json) {

@@ -16,6 +16,8 @@
  *   - and converts Graph's error envelope into a readable message.
  */
 
+import { createPageCache } from './cache.mjs';
+
 const USER_AGENT = 'onenote-mcp';
 
 /**
@@ -36,6 +38,30 @@ const SEARCH_CONCURRENCY = 6;
  */
 const CONTENT_CACHE_TTL_MS = 60_000;
 const CONTENT_CACHE_MAX_ENTRIES = 200;
+
+/**
+ * Attachment reading limits.
+ *
+ * Downloading embedded files is opt-outable and bounded: a page with a dozen
+ * large PDFs should not stall a conversation or flood the context.
+ */
+const MAX_ATTACHMENTS = 5;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_ATTACHMENT_CHARS = 40_000;
+
+/**
+ * Image limits.
+ *
+ * Images are by far the most expensive thing a tool can return. A 1200x800
+ * screenshot costs roughly 1,300 tokens; a full-height phone screenshot closer
+ * to 4,000. Two of those already outweigh the text of the page they sit on.
+ *
+ * So the default is deliberately small. Most pages carry none or one image, the
+ * result always reports how many more exist, and the model can ask for them.
+ * Paying for ten screenshots nobody asked about is the failure mode to avoid.
+ */
+const MAX_IMAGES = 2;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export class GraphError extends Error {
   constructor(message, { status, code, requestId, cause } = {}) {
@@ -60,6 +86,21 @@ export class OneNoteClient {
     this.log = log;
     /** @type {Map<string, {text: string, at: number}>} in-memory only, never persisted */
     this._contentCache = new Map();
+
+    /**
+     * Second tier: extracted text kept between sessions, on this machine only,
+     * scoped to the signed-in account. Disabled unless config asks for it, so
+     * anything constructing a client without a full config gets a no-op.
+     */
+    this.pageCache = createPageCache(config ?? {}, {
+      accountId: async () => (await this.auth?.getAccount?.())?.homeAccountId ?? null,
+      log
+    });
+  }
+
+  /** Persist any pending cache writes. Safe to call at any time. */
+  async flushCache() {
+    await this.pageCache.flush();
   }
 
   #cacheGet(key) {
@@ -470,6 +511,19 @@ export class OneNoteClient {
       resolvedId = (await this.resolveSection(section)).section.id;
     }
 
+    // OneNote refuses a cross-section page query once an account has enough
+    // sections, returning "maximum sections exceeded" rather than paginating.
+    // Fall back to walking sections individually so large notebooks still work.
+    if (!resolvedId) {
+      try {
+        return await this.#listPagesGlobally({ limit, orderBy });
+      } catch (error) {
+        if (!isMaximumSectionsError(error)) throw error;
+        this.log('Global page listing hit the section limit; falling back to per-section reads.');
+        return this.#listPagesPerSection({ limit, orderBy });
+      }
+    }
+
     const base = resolvedId
       ? `/me/onenote/sections/${encodeURIComponent(resolvedId)}/pages`
       : '/me/onenote/pages';
@@ -478,6 +532,64 @@ export class OneNoteClient {
       { limit }
     );
     return pages.map(shapePage);
+  }
+
+  /** The cheap path: one cross-section query. Works for most accounts. */
+  async #listPagesGlobally({ limit, orderBy }) {
+    const pages = await this.#collect(
+      '/me/onenote/pages' +
+        '?$select=id,title,createdDateTime,lastModifiedDateTime,contentUrl,links' +
+        `&$orderby=${encodeURIComponent(orderBy)}`,
+      { limit }
+    );
+    return pages.map(shapePage);
+  }
+
+  /**
+   * The fallback: ask each section for its pages and merge.
+   *
+   * Costs one request per section, so it runs a bounded pool and stops as soon
+   * as it has enough pages. Only reached when the global query is refused.
+   */
+  async #listPagesPerSection({ limit, orderBy }) {
+    const sections = await this.listSections({ limit: 400 });
+    const collected = [];
+    let cursor = 0;
+
+    const worker = async () => {
+      while (cursor < sections.length) {
+        const section = sections[cursor++];
+        try {
+          const pages = await this.#collect(
+            `/me/onenote/sections/${encodeURIComponent(section.id)}/pages` +
+              '?$select=id,title,createdDateTime,lastModifiedDateTime,contentUrl,links' +
+              '&$orderby=lastModifiedDateTime%20desc',
+            { limit: Math.min(limit, 100) }
+          );
+          for (const page of pages) {
+            collected.push({
+              ...shapePage(page),
+              sectionId: section.id,
+              sectionName: section.displayName
+            });
+          }
+        } catch (error) {
+          this.log(`Skipping section "${section.displayName}": ${error.message}`);
+        }
+      }
+    };
+
+    await Promise.all(
+      Array.from({ length: Math.min(SEARCH_CONCURRENCY, Math.max(1, sections.length)) }, worker)
+    );
+
+    const sorted = orderBy.startsWith('title')
+      ? collected.sort((a, b) => (a.title || '').localeCompare(b.title || ''))
+      : collected.sort(
+          (a, b) => new Date(b.lastModifiedDateTime ?? 0) - new Date(a.lastModifiedDateTime ?? 0)
+        );
+
+    return sorted.slice(0, limit);
   }
 
   async getPageMetadata(pageId) {
@@ -496,10 +608,33 @@ export class OneNoteClient {
    * @param {boolean} [options.includeIds=false] Ask Graph for element IDs, which
    *   are required if you intend to PATCH the page afterwards.
    */
-  async getPageContent(pageId, { format = 'text', includeIds = false } = {}) {
-    const cacheKey = `${pageId}:${format}:${includeIds ? 1 : 0}`;
+  async getPageContent(
+    pageId,
+    { format = 'text', includeIds = false, readAttachments = true, lastModified = null } = {}
+  ) {
+    const cacheKey = `${pageId}:${format}:${includeIds ? 1 : 0}:${readAttachments ? 1 : 0}`;
     const cached = this.#cacheGet(cacheKey);
     if (cached !== null) return { format, content: cached, cached: true };
+
+    /**
+     * Then the on-disk tier. Only plain text is kept there: raw HTML is several
+     * times larger, is only used by machine-facing paths, and would fill the
+     * budget with data nobody re-reads.
+     *
+     * `lastModified` is the whole safety mechanism -- without it we cannot know
+     * the page is unchanged, so we do not look.
+     */
+    const persistable = format === 'text' && Boolean(lastModified);
+    if (persistable) {
+      const stored = await this.pageCache.get(pageId, {
+        lastModified,
+        variant: `text:${includeIds ? 1 : 0}:${readAttachments ? 1 : 0}`
+      });
+      if (stored !== null) {
+        this.#cacheSet(cacheKey, stored);
+        return { format: 'text', content: stored, cached: true };
+      }
+    }
 
     const query = includeIds ? '?includeIDs=true' : '';
     const html = await this.#request(
@@ -507,15 +642,203 @@ export class OneNoteClient {
       { raw: true, headers: { Accept: 'text/html' } }
     );
 
+    // Stash the raw HTML so a follow-up image fetch does not download the whole
+    // page a second time. Reading a page with images was making two identical
+    // /content requests, doubling both latency and bandwidth for every read.
+    this.#cacheSet(`${pageId}:__html`, html);
+
     if (format === 'html') {
       this.#cacheSet(cacheKey, html);
       return { format: 'html', content: html };
     }
 
-    const { htmlToText } = await import('./html.mjs');
-    const text = htmlToText(html);
+    const { htmlToText, extractResources } = await import('./html.mjs');
+    let text = htmlToText(html);
+
+    if (readAttachments) {
+      const { attachments } = extractResources(html);
+      const extra = await this.#readAttachments(attachments);
+      if (extra) text += extra;
+    }
+
     this.#cacheSet(cacheKey, text);
+
+    if (persistable) {
+      await this.pageCache.set(pageId, {
+        lastModified,
+        variant: `text:${includeIds ? 1 : 0}:${readAttachments ? 1 : 0}`,
+        text
+      });
+    }
+
     return { format: 'text', content: text };
+  }
+
+  /**
+   * Download page images so they can be handed to a multimodal model.
+   *
+   * OneNote runs OCR on images, but Microsoft does not expose that text through
+   * the Graph API, so a clipped screenshot of a LinkedIn post arrives as a URL
+   * and nothing else. Bundling an OCR engine would add tens of megabytes and
+   * still read worse than a model that can see the image.
+   *
+   * So the images themselves are attached to the tool result. Claude reads the
+   * screenshot directly, which handles layout, tables inside images, and
+   * handwriting that character-level OCR would mangle.
+   *
+   * Bounded deliberately: images are expensive in tokens, and a page with
+   * thirty screenshots should not consume an entire context window.
+   *
+   * @returns {Promise<Array<{data: string, mimeType: string, alt: string}>>}
+   */
+  async #fetchImages(images, { maxImages }) {
+    const usable = images.filter((image) => image.url).slice(0, maxImages);
+    const results = [];
+
+    for (const image of usable) {
+      try {
+        const token = await this.auth.getAccessToken({ interactive: false });
+        const response = await fetch(image.url, {
+          headers: { Authorization: `Bearer ${token}`, 'User-Agent': USER_AGENT }
+        });
+        if (!response.ok) continue;
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (buffer.length > MAX_IMAGE_BYTES) {
+          this.log(`Skipping an image: ${(buffer.length / 1024 / 1024).toFixed(1)} MB is too large.`);
+          continue;
+        }
+
+        results.push({
+          data: buffer.toString('base64'),
+          mimeType: sniffImageType(buffer, response.headers.get('content-type')),
+          alt: image.alt || ''
+        });
+      } catch (error) {
+        this.log(`Could not fetch an image: ${error.message}`);
+      }
+    }
+
+    return results;
+  }
+
+  /**
+   * How many images a page has, without downloading any of them.
+   *
+   * Used to offer images rather than charge for them: the page HTML is already
+   * cached from the text read, so this normally costs nothing at all.
+   */
+  async countPageImages(pageId) {
+    const { extractResources } = await import('./html.mjs');
+    const html =
+      this.#cacheGet(`${pageId}:__html`) ??
+      (await this.#request(`/me/onenote/pages/${encodeURIComponent(pageId)}/content`, {
+        raw: true,
+        headers: { Accept: 'text/html' }
+      }));
+
+    return { imageCount: extractResources(html).images.length };
+  }
+
+  /**
+   * Fetch a page's images alongside its text.
+   *
+   * Kept separate from getPageContent so the text path stays cheap; callers opt
+   * in when they actually want to look at the pictures.
+   */
+  async getPageImages(pageId, { maxImages = MAX_IMAGES } = {}) {
+    const { extractResources } = await import('./html.mjs');
+
+    // Reuse the HTML the text read already downloaded, when it is still warm.
+    const html =
+      this.#cacheGet(`${pageId}:__html`) ??
+      (await this.#request(`/me/onenote/pages/${encodeURIComponent(pageId)}/content`, {
+        raw: true,
+        headers: { Accept: 'text/html' }
+      }));
+
+    const { images } = extractResources(html);
+    if (!images.length) return { images: [], total: 0 };
+
+    const fetched = await this.#fetchImages(images, { maxImages });
+    return { images: fetched, total: images.length };
+  }
+
+  /**
+   * Download attachments and append whatever text they contain.
+   *
+   * A page's HTML carries only a filename for an embedded file, so a research
+   * PDF sitting on a page was previously invisible: the assistant could see the
+   * note and none of the document it was about.
+   *
+   * PDFs are read with the dependency-free extractor in ./pdf.mjs. Other file
+   * types are named but not opened, and files that hold no text layer say so
+   * explicitly rather than appearing empty.
+   */
+  async #readAttachments(attachments) {
+    if (!attachments?.length) return '';
+
+    const { extractPdfText } = await import('./pdf.mjs');
+    const sections = [];
+
+    for (const attachment of attachments.slice(0, MAX_ATTACHMENTS)) {
+      const isPdf =
+        /pdf/i.test(attachment.type) || /\.pdf$/i.test(attachment.name);
+
+      if (!isPdf) {
+        sections.push(
+          `\n\n--- Attachment: ${attachment.name} ---\n` +
+            `This file type cannot be read as text. Open it in OneNote to view it.`
+        );
+        continue;
+      }
+
+      try {
+        const token = await this.auth.getAccessToken({ interactive: false });
+        const response = await fetch(attachment.url, {
+          headers: { Authorization: `Bearer ${token}`, 'User-Agent': USER_AGENT }
+        });
+
+        if (!response.ok) {
+          sections.push(
+            `\n\n--- Attachment: ${attachment.name} ---\n` +
+              `Could not download it (HTTP ${response.status}).`
+          );
+          continue;
+        }
+
+        const size = Number(response.headers.get('content-length') || 0);
+        if (size > MAX_ATTACHMENT_BYTES) {
+          sections.push(
+            `\n\n--- Attachment: ${attachment.name} ---\n` +
+              `Skipped: ${(size / 1024 / 1024).toFixed(1)} MB exceeds the read limit.`
+          );
+          continue;
+        }
+
+        const buffer = Buffer.from(await response.arrayBuffer());
+        const result = extractPdfText(buffer, { maxChars: MAX_ATTACHMENT_CHARS });
+
+        if (result.extractable) {
+          sections.push(
+            `\n\n--- Attachment: ${attachment.name}` +
+              `${result.pages ? ` (${result.pages} pages)` : ''} ---\n${result.text}`
+          );
+        } else {
+          sections.push(
+            `\n\n--- Attachment: ${attachment.name} ---\n` +
+              `No readable text: ${result.reason}.`
+          );
+        }
+      } catch (error) {
+        this.log(`Attachment "${attachment.name}" could not be read: ${error.message}`);
+        sections.push(
+          `\n\n--- Attachment: ${attachment.name} ---\nCould not be read: ${error.message}`
+        );
+      }
+    }
+
+    return sections.join('');
   }
 
   /**
@@ -590,7 +913,13 @@ export class OneNoteClient {
 
         const page = candidates[index];
         try {
-          const { content } = await this.getPageContent(page.id, { format: 'text' });
+          // The listing already carried lastModifiedDateTime, so validating a
+          // stored copy is free. This is where the cache pays for itself: a
+          // repeat search re-reads nothing it has already extracted.
+          const { content } = await this.getPageContent(page.id, {
+            format: 'text',
+            lastModified: page.lastModifiedDateTime ?? null
+          });
           scanned += 1;
 
           const at = content.toLowerCase().indexOf(lowerTerm);
@@ -757,6 +1086,38 @@ function shapeSection(section) {
     createdDateTime: section.createdDateTime,
     lastModifiedDateTime: section.lastModifiedDateTime
   };
+}
+
+/**
+ * OneNote rejects cross-section queries on accounts with many sections.
+ * The wording and code have varied over time, so match on both.
+ */
+function isMaximumSectionsError(error) {
+  const text = `${error?.code ?? ''} ${error?.message ?? ''}`;
+  return /maximum\s+sections?\s+exceeded|30104|20166/i.test(text);
+}
+
+/**
+ * Determine the real image type from magic bytes.
+ *
+ * OneNote sometimes serves resources as application/octet-stream, and a wrong
+ * mimeType makes the model reject the image outright.
+ */
+function sniffImageType(buffer, headerType) {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).toString('hex') === '89504e470d0a1a0a') {
+    return 'image/png';
+  }
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString('hex') === 'ffd8ff') return 'image/jpeg';
+  if (buffer.subarray(0, 3).toString('latin1') === 'GIF') return 'image/gif';
+  if (
+    buffer.subarray(0, 4).toString('latin1') === 'RIFF' &&
+    buffer.subarray(8, 12).toString('latin1') === 'WEBP'
+  ) {
+    return 'image/webp';
+  }
+
+  const declared = (headerType || '').split(';')[0].trim();
+  return /^image\//.test(declared) ? declared : 'image/png';
 }
 
 function ambiguousPage(query, matches) {

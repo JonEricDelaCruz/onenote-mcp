@@ -175,6 +175,15 @@ const DEFAULT_PAGE_CHARS = 12_000;
  */
 const DEFAULT_PAGE_LIMIT = 25;
 
+/**
+ * Below this much text, a page is effectively a picture with a title.
+ *
+ * A clipped screenshot with a one-line caption cannot be answered from its text,
+ * so its images are the content and get sent automatically. A page with real
+ * prose usually can be, so its images are announced instead of charged for.
+ */
+const THIN_PAGE_CHARS = 400;
+
 // ---------------------------------------------------------------------- server
 
 function createServer() {
@@ -338,18 +347,29 @@ function createServer() {
     {
       title: 'Sign out',
       description:
-        'Remove the cached Microsoft account and delete the local token cache file. The user must ' +
-        'authenticate again afterwards.',
+        'Remove the cached Microsoft account, delete the local token cache file, and forget any ' +
+        'page text remembered on this computer. The user must authenticate again afterwards.',
       inputSchema: z.object({}),
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true }
     },
     handler(async () => {
+      // Purge cached pages BEFORE dropping the tokens: afterwards the account
+      // can no longer be resolved, and purgeAllCaches has to fall back to
+      // matching filenames.
+      const { purgeAllCaches } = await import('./src/cache.mjs');
+      await onenote.pageCache.clear().catch(() => {});
+      const purged = await purgeAllCaches(config);
+
       const result = await auth.signOut();
+      const alsoCleared = purged.removed
+        ? ` Remembered page text was deleted as well (${purged.removed} file(s)).`
+        : ' No page text was stored.';
+
       return ok(
-        result.signedOut
+        (result.signedOut
           ? `Signed out. Token cache removed from ${result.cachePath}.`
-          : 'No account was signed in. Token cache removed if it existed.',
-        result
+          : 'No account was signed in. Token cache removed if it existed.') + alsoCleared,
+        { ...result, cachedPageFilesRemoved: purged.removed }
       );
     })
   );
@@ -541,8 +561,10 @@ function createServer() {
     {
       title: 'Get page content',
       description:
-        'Read one page by ID. Returns readable text by default; pass format="html" for the raw ' +
-        'XHTML, and includeIds=true if you intend to modify the page afterwards.',
+        'Read one page. Returns readable text including tables (as Markdown), image captions, ' +
+        'and the text of any attached PDFs. Pass format="html" for raw XHTML. If the result ' +
+        'mentions an image or attachment whose text is unavailable, say so rather than treating ' +
+        'the page as complete.',
       inputSchema: z.object({
         page: PageRef,
         section: SectionRef.optional().describe(
@@ -556,6 +578,36 @@ function createServer() {
           .boolean()
           .optional()
           .describe('Include OneNote element IDs, required for later PATCH operations.'),
+        includeImages: z
+          .boolean()
+          .optional()
+          .describe(
+            'Attach the page images so you can READ them yourself, which is how text inside a ' +
+              'screenshot becomes available at all (Microsoft does not expose its OCR). ' +
+              'LEAVE THIS UNSET normally: images cost 1,300-4,000 tokens each, so by default ' +
+              'they are only sent when a page has too little text to answer from, and merely ' +
+              'announced otherwise. Set true when the user asks to see them, or when the answer ' +
+              'is plainly inside a picture. Set false to skip them entirely.'
+          ),
+        maxImages: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .optional()
+          .describe(
+            'How many images to attach. Defaults to 2, because images are expensive: a screenshot ' +
+              'costs roughly 1,300-4,000 tokens, often more than the page text. The result says ' +
+              'how many more exist; raise this only when the user needs them.'
+          ),
+        readAttachments: z
+          .boolean()
+          .optional()
+          .describe(
+            'Download embedded files and include their text. On by default. PDFs with a text ' +
+              'layer are read in full; scanned PDFs and other file types are named but not opened. ' +
+              'Set false to skip the download and read only the page itself.'
+          ),
         maxLength: z
           .number()
           .int()
@@ -569,11 +621,17 @@ function createServer() {
       }),
       annotations: { readOnlyHint: true, openWorldHint: true }
     },
-    handler(async ({ page, section, format, includeIds, maxLength }) => {
+    handler(async ({ page, section, format, includeIds, maxLength, readAttachments, includeImages, maxImages }) => {
       const meta = (await onenote.resolvePage(page, { section })).page;
       const { content, format: actual } = await onenote.getPageContent(meta.id, {
         format: format ?? 'text',
-        includeIds: includeIds ?? false
+        includeIds: includeIds ?? false,
+        // Was accepted in the schema but never forwarded, so `false` silently
+        // did nothing and attachments were always downloaded.
+        readAttachments: readAttachments ?? true,
+        // Lets the stored copy be reused when the page has not been edited.
+        // resolvePage already fetched this, so it costs nothing extra.
+        lastModified: meta.lastModifiedDateTime ?? null
       });
 
       const cap = maxLength ?? DEFAULT_PAGE_CHARS;
@@ -585,22 +643,116 @@ function createServer() {
         `${meta.sectionName ? `  (${meta.sectionName})` : ''}` +
         `\n_Modified ${shortDate(meta.lastModifiedDateTime)}_\n\n`;
 
-      // The body appears ONLY here, not repeated in structuredContent. Sending
-      // it in both fields doubled the cost of every page read.
-      return ok(
-        header +
-          body +
-          (truncated
-            ? `\n\n(Showing ${cap.toLocaleString()} of ${content.length.toLocaleString()} characters. ` +
-              'Call again with a larger maxLength for the rest.)'
-            : ''),
-        {
-          page: { id: meta.id, title: meta.title, section: meta.sectionName ?? undefined },
-          format: actual,
-          chars: content.length,
-          truncated
+        // NO structuredContent here, deliberately.
+        //
+        // Splitting the body into `content` and metadata into `structuredContent`
+        // looked like a clean token saving, but MCP clients differ in which field
+        // they surface to the model. When a client showed structuredContent, the
+        // model received `{title, chars, truncated}` and concluded the page had no
+        // body: it could locate a 19,000-character note and not read a word of it.
+        //
+        // Rule for this server: anything the model needs lives in the text.
+        // structuredContent is a convenience mirror, never the sole home of
+        // anything that matters.
+        const blocks = [
+          {
+            type: 'text',
+            text:
+              header +
+              body +
+              (truncated
+                ? `\n\n(Showing ${cap.toLocaleString()} of ${content.length.toLocaleString()} ` +
+                  'characters. Call again with a larger maxLength for the rest.)'
+                : '')
+          }
+        ];
+
+        // Decide whether images are worth their cost on THIS page.
+        //
+        // Images run 1,300-4,000 tokens each, often more than the page they sit
+        // on, so sending them with every read taxes the many questions that
+        // never needed them. Instead:
+        //
+        //   never  - skip entirely
+        //   always - send up to the cap
+        //   auto   - send only when the page is mostly picture; otherwise say
+        //            they exist and let the user or the model ask
+        //
+        // Announcing beats silently omitting: the reader learns there is more
+        // to see and can decide, which is the whole point of the trade.
+        //
+        // Microsoft OCRs images for OneNote's own search but does not expose
+        // that text through the API, so a clipped screenshot of a LinkedIn post
+        // would otherwise be unreadable. Handing over the picture works better
+        // than bundling an OCR engine: a multimodal model handles layout,
+        // tables inside images, and handwriting that character-level OCR
+        // mangles.
+        const mode = config.imageMode;
+        const isTextFormat = (format ?? 'text') === 'text';
+        const pageIsMostlyPicture = content.trim().length < THIN_PAGE_CHARS;
+
+        const wantsImages =
+          isTextFormat &&
+          (includeImages === true ||
+            (includeImages !== false &&
+              (mode === 'always' || (mode === 'auto' && pageIsMostlyPicture))));
+
+        // When images are held back, say so plainly enough that the assistant
+        // can offer them to the user in the same breath.
+        if (!wantsImages && isTextFormat && includeImages !== false && mode !== 'never') {
+          try {
+            const { imageCount } = await onenote.countPageImages(meta.id);
+            if (imageCount) {
+              blocks.push({
+                type: 'text',
+                text:
+                  `\n\n[This page also has ${imageCount} image${imageCount > 1 ? 's' : ''}. ` +
+                  'They were not read, because images are expensive and this page has enough ' +
+                  'text to work from. If the answer might be inside a screenshot, tell the user ' +
+                  'they can ask you to "read the images on this page", then call getPage again ' +
+                  'with includeImages: true.]'
+              });
+            }
+          } catch {
+            // Counting is a nicety; never fail the read over it.
+          }
         }
-      );
+
+        if (wantsImages) {
+          try {
+            const { images, total } = await onenote.getPageImages(meta.id, {
+              maxImages: maxImages ?? 2
+            });
+
+            for (const image of images) {
+              if (image.alt) {
+                blocks.push({ type: 'text', text: `\nImage caption: ${image.alt}` });
+              }
+              blocks.push({ type: 'image', data: image.data, mimeType: image.mimeType });
+            }
+
+            if (images.length) {
+              blocks.push({
+                type: 'text',
+                text:
+                  `\n(${images.length} of ${total} image(s) on this page are attached above. ` +
+                  'Read any text in them directly and treat it as part of the page.' +
+                  (total > images.length
+                    ? ` Raise maxImages to see the remaining ${total - images.length}.`
+                    : '') +
+                  ')'
+              });
+            }
+          } catch (error) {
+            log(`Could not attach images: ${error.message}`);
+            blocks.push({
+              type: 'text',
+              text: '\n(This page has images, but they could not be downloaded.)'
+            });
+          }
+        }
+
+        return { content: blocks };
     })
   );
 
@@ -820,9 +972,22 @@ const handle = serveStdio(createServer, {
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
-    handle.close().finally(() => process.exit(0));
+    // Flush before exiting, or a session's worth of extracted text is thrown
+    // away and re-downloaded next time. Bounded so a stuck write cannot hang
+    // the shutdown an AI app is waiting on.
+    Promise.race([
+      onenote.flushCache().catch(() => {}),
+      new Promise((resolve) => setTimeout(resolve, 1000))
+    ])
+      .then(() => handle.close())
+      .finally(() => process.exit(0));
   });
 }
+
+// Covers the ordinary case where the event loop simply drains.
+process.on('beforeExit', () => {
+  onenote.flushCache().catch(() => {});
+});
 
 /**
  * Minimal .env reader.

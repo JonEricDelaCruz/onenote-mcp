@@ -89,19 +89,48 @@ Sections can be referred to by **name** — `"Ideas"` or `"Learn / Cooking"` —
 | `listNotebooks` | List your notebooks |
 | `listSections` | Sections, including those inside section groups |
 | `listPages` | Pages, optionally within one section |
-| `getPage` | Read a page's full content |
+| `getPage` | Read a page: text, tables, attached PDF text, and images on request |
 | `searchPages` | Search by title, or by full text |
 | `createPage` | Create a page |
 | `appendToPage` | Add to an existing page |
 | `createSection` | Create a section |
 | `deletePage` | Delete a page (requires confirming the exact title) |
-| `authStatus` / `authenticate` / `signOut` | Sign-in management |
+| `authStatus` / `authenticate` / `signOut` | Sign-in management (sign-out also wipes cached pages) |
 
 </details>
+
+## What it can read
+
+| In your notes | Readable? |
+|---|---|
+| Text, headings, lists | Yes |
+| Tables | Yes, converted to Markdown |
+| Attached PDFs with a text layer | Yes, downloaded and read |
+| Screenshots and images | Yes, Claude reads them directly |
+| Scanned PDFs and printouts | Yes, as page images Claude reads |
+| Handwriting | Usually, if legible |
+
+**How image text works.** Microsoft runs OCR for OneNote's own search but doesn't expose that text through the API, so no Graph-based tool can fetch it.
+
+Instead of bundling an OCR engine, this passes the image itself to Claude, which reads it directly. That handles layout, tables inside screenshots, and handwriting better than character-level OCR would.
+
+**Images are offered, not charged for.** A screenshot costs roughly 1,300 to 4,000 tokens — often more than the page text it sits on — so reading every image on every page would tax the many questions that never needed one.
+
+By default, images are only read when a page has too little text to answer from, which is exactly the case where the picture *is* the content: a clipped screenshot, a scanned receipt, a whiteboard photo. On a page with real writing, Claude is simply told the images exist:
+
+> *[This page also has 3 images. They were not read... ask to read the images on this page.]*
+
+Then you decide. *"Read the images on that page"* pulls them in. *"Read it without the images"* skips them. Two per read by default, and the result always says how many more remain.
+
+Prefer the old behaviour? Set **When to read images** to `always` in the extension settings — or `never` to keep images out entirely.
+
+Since images go to your AI app the same way pasting one does, [PRIVACY.md](PRIVACY.md) documents it explicitly.
 
 ## Your privacy
 
 **Your notes never pass through anyone else's server.** They go directly from Microsoft to your own computer. There is no hosted backend, no analytics, and no telemetry.
+
+**Pages you read are remembered on your own machine**, so re-reading an unchanged page costs nothing. That cache sits in your private config folder, is scoped to your Microsoft account, is never transmitted anywhere, and is deleted when you sign out. `cache status` shows it, `cache clear` wipes it, and one setting turns it off. [Full details](PRIVACY.md#pages-you-have-read-are-remembered-on-your-computer).
 
 **Your sign-in stays on your machine.** It's handled by Microsoft's official authentication library and stored in your user config folder, readable only by your account. Nobody — including the author of this tool — can see your notes or your credentials.
 
@@ -132,6 +161,8 @@ In Claude Desktop, open Settings → Extensions → OneNote for Claude. Everythi
 | Setting | Default | What it does |
 |---|---|---|
 | **Default section for new notes** | blank | Pin a section so you needn't say where each time |
+| **When to read images** | `auto` | `auto` reads them only when a page is mostly picture; `always` every time; `never` not at all |
+| **Remember pages between sessions** | `disk` | Reuse already-read pages instead of re-downloading. `memory` keeps it session-only; `off` disables it |
 | **Allow Claude to change your notes** | on | Turn off to make it read-only |
 | **Microsoft account type** | `common` | Leave alone unless IT tells you otherwise |
 | **Microsoft application ID** | blank | Only if your organization requires its own app registration |
@@ -149,6 +180,8 @@ Copy `.env.example` to `.env`. All optional except where noted.
 | `ONENOTE_SCOPES` | `Notes.ReadWrite offline_access` | Graph permissions |
 | `ONENOTE_ALLOW_WRITE` | `true` | `false` disables all write tools |
 | `ONENOTE_DEFAULT_SECTION` | unset | Section new pages go to when unspecified |
+| `ONENOTE_IMAGE_MODE` | `auto` | `auto`, `always`, or `never` — when to send page images |
+| `ONENOTE_CACHE_MODE` | `disk` | `disk`, `memory`, or `off` — remembering already-read pages |
 | `ONENOTE_TOKEN_CACHE` | OS config dir | Where credentials are cached |
 | `ONENOTE_REDIRECT_PORT` | random | Pin the sign-in callback port |
 | `ONENOTE_ALLOW_DEVICE_CODE` | `false` | Use device code flow instead of a browser |
@@ -197,7 +230,7 @@ It checks every layer — Node version, configuration, credentials, whether Micr
 ## Development
 
 ```bash
-npm test        # 112 tests, including end-to-end protocol tests
+npm test        # 181 tests, including end-to-end protocol tests
 npm run check   # syntax check
 npm run audit   # dependency advisories
 npm run bundle  # build the .mcpb
@@ -218,6 +251,7 @@ src/auth.mjs         Microsoft sign-in, token cache, non-blocking auth
 src/onenote.mjs      Graph client: pagination, retries, error mapping
 src/parse-html.mjs   Self-contained HTML parser (replaces jsdom)
 src/html.mjs         OneNote HTML to readable text
+src/cache.mjs        Local, per-account cache of extracted page text
 src/clients.mjs      Safe editing of AI app config files
 scripts/             Bundle build
 ```

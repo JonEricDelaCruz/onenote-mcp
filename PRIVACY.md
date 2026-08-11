@@ -8,7 +8,7 @@ all.
 
 This document explains exactly how, so you can verify it rather than trust it.
 
-Last updated: 2026-08-04 · Applies to: OneNote for Claude v2.0.0
+Last updated: 2026-08-11 · Applies to: OneNote for Claude v2.1.0
 
 ---
 
@@ -88,6 +88,7 @@ Every network request this software can make, exhaustively:
 | Signing in | `login.microsoftonline.com` | Your sign-in, handled by Microsoft's own library | A token, stored on your machine |
 | Listing structure | `graph.microsoft.com` | Your token | Notebook and section names |
 | Reading a page | `graph.microsoft.com` | Your token, the page ID | That page's content |
+| Reading a page's images | `graph.microsoft.com` | Your token, the image ID | The image file |
 | Searching | `graph.microsoft.com` | Your token | Page titles, plus page bodies if you enabled content search |
 | Writing | `graph.microsoft.com` | Your token, the text you asked to save | Confirmation |
 
@@ -113,6 +114,32 @@ AI provider's** privacy policy (Anthropic's, if you're using Claude) exactly lik
 anything else you type or paste. That's the one place your note content leaves
 your machine, and it happens because you asked a question about it.
 
+**This can include images, but only in specific cases.** Microsoft runs OCR on
+your images so OneNote's own search can find them, but does not expose that text
+through the API. So the image file itself is passed to your AI app, which reads
+it directly. That is how text inside a screenshot becomes available at all.
+
+Because that is both expensive and more of your data leaving your machine, it is
+not the default. By default (`auto`):
+
+- Images are downloaded and sent **only when the page has too little text to
+  answer from** — under 400 characters, meaning the page is essentially just a
+  picture. At most two per read.
+- On every other page, **no image is downloaded**. The tool counts them from the
+  page HTML it already has and tells your assistant they exist, so you can ask.
+  Counting costs no additional request and transmits nothing.
+
+You are always in control:
+
+- *"Read it without the images"* → nothing is downloaded
+- Set **When to read images** to `never` in the extension settings → images are
+  never fetched or sent under any circumstances
+- Set it to `always` → every read includes them
+
+A screenshot sent this way is treated exactly like one you dragged into the chat
+yourself. Images go nowhere except your AI provider, and are never written to
+disk.
+
 Nothing routes through any server belonging to this tool's author. There is no
 such server.
 
@@ -128,26 +155,79 @@ Only what your request requires:
 Nothing is bulk-downloaded, indexed, or copied. There is no local database of
 your notes.
 
-**One exception, stated plainly: a short-lived memory cache.** When you search
-inside your notes, the pages that were read are held **in memory for 60
-seconds**, so a follow-up question ("now find X in those same notes") doesn't
-re-download everything. Specifics:
+### Pages you have read are remembered on your computer
 
-- It lives in the running process's memory only — **never written to disk**
-- It holds at most 200 pages and expires after 60 seconds
-- It disappears entirely the moment the process stops, which is when you quit
-  your AI app
-- It is never transmitted anywhere
+This is the one place note content is stored, so it is worth being exact.
 
-If you'd rather it didn't exist at all, it's about fifteen lines in
-`src/onenote.mjs` (search for `CONTENT_CACHE_TTL_MS`) and the tool works without
-it — just more slowly.
+When you read a page, the extracted text is kept on your own machine. Reading it
+again later reuses that copy instead of downloading and re-processing the page.
+That is the whole reason it exists: re-reading an unchanged page is wasted work.
+
+**Where it is kept**
+
+| | |
+|---|---|
+| **macOS** | `~/Library/Application Support/onenote-mcp/cache/pages-<hash>.json` |
+| **Windows** | `%APPDATA%\onenote-mcp\cache\pages-<hash>.json` |
+| **Linux** | `~/.config/onenote-mcp/cache/pages-<hash>.json` |
+
+Same protection as your sign-in token: file mode `0600` inside a `0700`
+directory, readable only by your user account, written atomically.
+
+**What is in it**
+
+The plain text of pages you asked about — nothing else. No images (those are
+never written to disk). No credentials. Not your whole notebook: only pages you
+actually opened.
+
+**It is yours alone**
+
+- The `<hash>` in the filename is derived from your Microsoft account ID, so two
+  accounts on the same computer cannot read each other's cached pages — and the
+  filename itself does not spell out who you are.
+- **It is never transmitted anywhere.** `src/cache.mjs` contains no network code
+  at all. There is no server to send it to.
+- It is not shared between users, machines, or installs. Someone else running
+  this tool has their own cache of their own notes, and no path exists between
+  the two.
+
+**It cannot go stale.** Before reusing a stored page, the tool compares it
+against the page's `lastModifiedDateTime` — a value Microsoft already returned
+in the listing it just fetched. If you edited the page by so much as a
+character, the stored copy is discarded and the page is re-downloaded. There is
+no expiry window during which you might get an old answer.
+
+**Limits.** At most 500 pages or about 4 MB of text, whichever comes first,
+after which the least recently used entries are dropped.
+
+**How to see it, wipe it, or turn it off**
+
+```bash
+npx @joneericdelacruz/onenote-mcp cache status   # what is stored, and where
+npx @joneericdelacruz/onenote-mcp cache clear    # delete all of it
+```
+
+Signing out deletes it too — ask Claude to sign out, and the cached text goes
+with the credentials.
+
+To stop it being written at all, open Settings → Extensions → OneNote for Claude
+and set **Remember pages between sessions** to:
+
+- `memory` — kept only while your AI app is running, nothing written to disk
+- `off` — no caching of any kind
+
+**Also, a 60-second memory cache.** Separately from the above, pages read during
+a search are held in the running process's memory for 60 seconds so a follow-up
+question doesn't re-fetch them. It holds at most 200 pages, is never written to
+disk, and vanishes when you quit your AI app.
 
 ---
 
 ## What's stored on your computer
 
-One file: your Microsoft sign-in token.
+Two things: your Microsoft sign-in token, and the text of pages you have read.
+
+### Your sign-in token
 
 | | |
 |---|---|
@@ -160,10 +240,19 @@ a `0700` directory, and written atomically so it can't be left half-finished. Th
 file is managed by MSAL, Microsoft's own official authentication library — this
 project never handles your password, and never sees it.
 
-**No notes are ever written to disk.** No cache, no index, no logs of content.
+**Note text is written to disk in one place only:** the page cache described
+above, in your own config folder, which you can inspect, wipe, or switch off. No
+index, no database, no logs of content, and nothing written anywhere else.
 
 **To delete it:** ask Claude to sign out, or run `npx @joneericdelacruz/onenote-mcp signout`,
-or just delete the file above.
+or just delete the file above. Signing out removes the cached page text as well.
+
+### Remembered page text
+
+Covered in full under ["Pages you have read are remembered on your
+computer"](#pages-you-have-read-are-remembered-on-your-computer) above: your
+config folder, mode `0600`, scoped to your account, never transmitted, wiped by
+`cache clear` or by signing out.
 
 ---
 
@@ -179,6 +268,8 @@ specific about:
 - ❌ No advertising or advertising identifiers
 - ❌ No user accounts, licence keys, or registration
 - ❌ No data sold, shared, or transmitted to any third party
+- ❌ No cached note text leaving your machine — the cache is local-only, per
+  account, and readable by no one but you
 - ❌ No background processes, daemons, or scheduled tasks
 - ❌ No network access to any host other than Microsoft's
 
@@ -229,6 +320,7 @@ matter for privacy:
 
 - `src/onenote.mjs` — every Microsoft API call
 - `src/auth.mjs` — sign-in and token storage
+- `src/cache.mjs` — what is remembered on disk, and how it is protected
 - `onenote-mcp.mjs` — the tools exposed to the AI
 
 **Watch its traffic.** Use Little Snitch (macOS), Wireshark, or any firewall. The

@@ -59,7 +59,14 @@ describe('htmlToText', () => {
   });
 
   test('keeps image alt text', () => {
-    assert.match(htmlToText('<body><p><img alt="diagram" /></p></body>'), /\[image: diagram\]/);
+    // Alt text is the only image text Microsoft exposes, so it must survive.
+    assert.match(htmlToText('<body><p><img alt="diagram" /></p></body>'), /\[Image: diagram\]/);
+  });
+
+  test('says so when an image carries no readable text', () => {
+    const text = htmlToText('<body><p><img src="x.png" /></p></body>');
+    assert.match(text, /no caption/i);
+    assert.match(text, /not available/i);
   });
 
   test('drops script and style content', () => {

@@ -25,6 +25,11 @@ out/
 token-cache.json
 *.token-cache.json
 
+# Locally cached page text. Belt and braces: this is written to the OS config
+# directory, never the repo, but a stray copy must never be committable.
+pages-*.json
+cache/
+
 # The local MCP SDK checkout the v1 setup instructions told you to clone.
 # No longer used -- the SDK comes from npm.
 typescript-sdk/
