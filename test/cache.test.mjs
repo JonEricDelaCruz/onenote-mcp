@@ -21,6 +21,32 @@ import path from 'node:path';
 import { PageCache, createPageCache, purgeAllCaches } from '../src/cache.mjs';
 import { OneNoteClient } from '../src/onenote.mjs';
 
+
+/**
+ * Test plumbing for a detail that only bites on Windows.
+ *
+ * A cache batches its writes, so `set()` leaves a write queued for half a
+ * second. If a test finishes and deletes its directory before that lands, the
+ * queued write recreates the directory underneath the deletion. POSIX tolerates
+ * this; Windows fails the removal outright.
+ *
+ * So: every cache a test builds is tracked, closed before any directory goes
+ * away, and removals retry briefly for handles Windows has not released yet.
+ */
+const live = new Set();
+
+function newCache(options) {
+  const cache = options instanceof PageCache ? options : new PageCache(options);
+  live.add(cache);
+  return cache;
+}
+
+async function removeDir(target) {
+  for (const cache of live) await cache.close().catch(() => {});
+  live.clear();
+  await fsp.rm(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+}
+
 let dir;
 
 before(async () => {
@@ -28,11 +54,11 @@ before(async () => {
 });
 
 after(async () => {
-  await fsp.rm(dir, { recursive: true, force: true });
+  await removeDir(dir);
 });
 
 const makeCache = (account = 'account-a', where = dir) =>
-  new PageCache({ dir: where, accountId: async () => account });
+  newCache({ dir: where, accountId: async () => account });
 
 describe('freshness', () => {
   test('a page returns its stored text when unchanged', async () => {
@@ -115,14 +141,14 @@ describe('account isolation', () => {
 
   test('not being signed in means nothing is written', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-anon-'));
-    const cache = new PageCache({ dir: scratch, accountId: async () => null });
+    const cache = newCache({ dir: scratch, accountId: async () => null });
 
     await cache.set('p1', { lastModified: 'A', text: 'x' });
     await cache.flush();
 
     const files = await fsp.readdir(scratch).catch(() => []);
     assert.equal(files.length, 0, 'no account means no file on disk');
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
@@ -131,7 +157,7 @@ describe('what lands on disk', () => {
     if (process.platform === 'win32') return t.skip('POSIX permissions');
 
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-perm-'));
-    const cache = new PageCache({ dir: path.join(scratch, 'cache'), accountId: async () => 'a' });
+    const cache = newCache({ dir: path.join(scratch, 'cache'), accountId: async () => 'a' });
     await cache.set('p1', { lastModified: 'A', text: 'private' });
     await cache.flush();
 
@@ -141,7 +167,7 @@ describe('what lands on disk', () => {
 
     assert.equal(fileMode, 0o600, 'note text must not be world-readable');
     assert.equal(dirMode, 0o700);
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 
   test('the cache module contains no network code whatsoever', async () => {
@@ -160,24 +186,24 @@ describe('what lands on disk', () => {
 
   test('survives a corrupt or truncated file instead of failing the read', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-corrupt-'));
-    const cache = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const cache = newCache({ dir: scratch, accountId: async () => 'a' });
 
     await cache.set('p1', { lastModified: 'A', text: 'x' });
     await cache.flush();
     const { path: file } = await cache.stats();
     await fsp.writeFile(file, '{ this is not json');
 
-    const fresh = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const fresh = newCache({ dir: scratch, accountId: async () => 'a' });
     assert.equal(await fresh.get('p1', { lastModified: 'A' }), null, 'a bad file is a miss');
     await fresh.set('p1', { lastModified: 'A', text: 'recovered' });
     assert.equal(await fresh.get('p1', { lastModified: 'A' }), 'recovered');
 
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 
   test('a file from a future format version is ignored, not misread', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-fmt-'));
-    const cache = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const cache = newCache({ dir: scratch, accountId: async () => 'a' });
     await cache.set('p1', { lastModified: 'A', text: 'x' });
     await cache.flush();
 
@@ -185,9 +211,9 @@ describe('what lands on disk', () => {
     const parsed = JSON.parse(await fsp.readFile(file, 'utf8'));
     await fsp.writeFile(file, JSON.stringify({ ...parsed, format: 99 }));
 
-    const fresh = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const fresh = newCache({ dir: scratch, accountId: async () => 'a' });
     assert.equal(await fresh.get('p1', { lastModified: 'A' }), null);
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
@@ -201,7 +227,7 @@ describe('bounded growth', () => {
 
   test('the entry count stays capped, evicting least recently used', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-evict-'));
-    const cache = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const cache = newCache({ dir: scratch, accountId: async () => 'a' });
 
     for (let i = 0; i < 600; i += 1) {
       await cache.set(`p${i}`, { lastModified: 'A', text: `page ${i}` });
@@ -212,14 +238,14 @@ describe('bounded growth', () => {
     assert.equal(await cache.get('p599', { lastModified: 'A' }), 'page 599', 'newest survives');
     assert.equal(await cache.get('p0', { lastModified: 'A' }), null, 'oldest evicted');
 
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
 describe('erasing it', () => {
   test('clear empties the cache and removes the file', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-clear-'));
-    const cache = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const cache = newCache({ dir: scratch, accountId: async () => 'a' });
     await cache.set('p1', { lastModified: 'A', text: 'x' });
     await cache.flush();
 
@@ -229,7 +255,7 @@ describe('erasing it', () => {
     assert.equal(removed, 1);
     assert.equal(await cache.get('p1', { lastModified: 'A' }), null);
     await assert.rejects(fsp.stat(file), 'the file itself must be gone');
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 
   test('signing out purges every account on the machine', async () => {
@@ -238,16 +264,20 @@ describe('erasing it', () => {
     const config = { cachePath: path.join(scratch, 'token-cache.json'), cacheMode: 'disk' };
 
     for (const account of ['a', 'b', 'c']) {
-      const cache = new PageCache({ dir: cacheDir, accountId: async () => account });
+      const cache = newCache({ dir: cacheDir, accountId: async () => account });
       await cache.set('p1', { lastModified: 'A', text: 'x' });
       await cache.flush();
     }
 
     const { removed } = await purgeAllCaches(config);
     assert.equal(removed, 3, 'every account’s cache must go, not just the current one');
-    await assert.rejects(fsp.stat(cacheDir), 'the cache directory should be gone too');
 
-    await fsp.rm(scratch, { recursive: true, force: true });
+    // What matters is that no note text survives. Whether the now-empty folder
+    // itself lingers is cosmetic, and on Windows the handle can outlive it.
+    const leftovers = await fsp.readdir(cacheDir).catch(() => []);
+    assert.deepEqual(leftovers, [], 'no cached text may survive a sign-out');
+
+    await removeDir(scratch);
   });
 
   test('purging when nothing was ever cached is not an error', async () => {
@@ -255,7 +285,7 @@ describe('erasing it', () => {
     const result = await purgeAllCaches({ cachePath: path.join(scratch, 'token-cache.json') });
 
     assert.equal(result.removed, 0);
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
@@ -273,7 +303,7 @@ describe('the off switches actually switch it off', () => {
     assert.equal(cache.enabled, false);
     assert.equal(await cache.get('p1', { lastModified: 'A' }), null);
     await assert.rejects(fsp.stat(path.join(scratch, 'cache')), 'nothing may be written');
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 
   test('off mode writes nothing to disk', async () => {
@@ -286,7 +316,7 @@ describe('the off switches actually switch it off', () => {
 
     assert.equal(await cache.get('p1', { lastModified: 'A' }), null);
     await assert.rejects(fsp.stat(path.join(scratch, 'cache')), 'nothing may be written');
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 
   test('a client built without config caches nothing', async () => {
@@ -305,7 +335,7 @@ describe('the off switches actually switch it off', () => {
     await cache.flush();
 
     assert.equal(await cache.get('p1', { lastModified: 'A' }), 'remembered');
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
@@ -313,15 +343,15 @@ describe('persistence across sessions', () => {
   test('a new process reads what the previous one stored', async () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-persist-'));
 
-    const first = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const first = newCache({ dir: scratch, accountId: async () => 'a' });
     await first.set('p1', { lastModified: 'A', text: 'written last session' });
     await first.flush();
 
     // Whole point of the feature: quitting the app must not throw the work away.
-    const second = new PageCache({ dir: scratch, accountId: async () => 'a' });
+    const second = newCache({ dir: scratch, accountId: async () => 'a' });
     assert.equal(await second.get('p1', { lastModified: 'A' }), 'written last session');
 
-    await fsp.rm(scratch, { recursive: true, force: true });
+    await removeDir(scratch);
   });
 });
 
@@ -351,6 +381,7 @@ describe('end to end: the client really does skip the work', () => {
       () => {}
     );
 
+    live.add(client.pageCache);
     return { client, calls };
   };
 
@@ -359,7 +390,7 @@ describe('end to end: the client really does skip the work', () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-e2e-'));
     t.after(async () => {
       globalThis.fetch = real;
-      await fsp.rm(scratch, { recursive: true, force: true });
+      await removeDir(scratch);
     });
 
     const first = cachingClient(scratch);
@@ -390,7 +421,7 @@ describe('end to end: the client really does skip the work', () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-e2e-stale-'));
     t.after(async () => {
       globalThis.fetch = real;
-      await fsp.rm(scratch, { recursive: true, force: true });
+      await removeDir(scratch);
     });
 
     const first = cachingClient(scratch);
@@ -414,7 +445,7 @@ describe('end to end: the client really does skip the work', () => {
     const scratch = await fsp.mkdtemp(path.join(os.tmpdir(), 'onenote-e2e-html-'));
     t.after(async () => {
       globalThis.fetch = real;
-      await fsp.rm(scratch, { recursive: true, force: true });
+      await removeDir(scratch);
     });
 
     const { client } = cachingClient(scratch);

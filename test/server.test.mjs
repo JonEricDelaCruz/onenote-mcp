@@ -14,7 +14,7 @@
 
 import { test, describe, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { converse as rpcConverse } from './rpc-client.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
@@ -38,51 +38,14 @@ const ENV = {
   ONENOTE_SKIP_DOTENV: '1'
 };
 
-/** Send a batch of JSON-RPC messages, collect stdout responses, then exit. */
-function converse(messages, { env = ENV, timeoutMs = 15000 } = {}) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SERVER], {
-      env,
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-
-    let stdout = '';
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error(`Timed out after ${timeoutMs}ms.\nstderr:\n${stderr}`));
-    }, timeoutMs);
-
-    child.stdout.on('data', (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on('data', (chunk) => {
-      stderr += chunk;
-    });
-
-    child.on('error', reject);
-    child.on('close', (code) => {
-      clearTimeout(timer);
-      const responses = stdout
-        .split('\n')
-        .filter((line) => line.trim())
-        .map((line) => {
-          try {
-            return JSON.parse(line);
-          } catch {
-            return { unparsed: line };
-          }
-        });
-      resolve({ responses, stderr, stdout, code });
-    });
-
-    for (const message of messages) {
-      child.stdin.write(`${JSON.stringify(message)}\n`);
-    }
-
-    // Give the server a moment to answer, then close the input side.
-    setTimeout(() => child.stdin.end(), 1200);
-  });
+/**
+ * Send JSON-RPC messages to a real server and collect the replies.
+ *
+ * `waitForExit` because several of these tests assert on the exit code: a bad
+ * configuration has to exit 1, not merely refuse to answer.
+ */
+function converse(messages, { env = ENV, timeoutMs = 30000 } = {}) {
+  return rpcConverse(SERVER, messages, { env, timeoutMs, waitForExit: true });
 }
 
 after(async () => {

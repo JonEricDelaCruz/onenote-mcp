@@ -37,7 +37,7 @@
  * good text outside it.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 
@@ -65,6 +65,7 @@ class NullCache {
   }
   async set() {}
   async flush() {}
+  async close() {}
   async clear() {
     return { removed: 0 };
   }
@@ -91,6 +92,16 @@ export class PageCache {
     this._dirty = false;
     this._timer = null;
     this._loading = null;
+    this._closed = false;
+
+    /**
+     * Unique per instance, not just per process. Two clients in one process
+     * (a test, or a host that opens a second connection) would otherwise pick
+     * the same temp filename and race each other's rename. On POSIX that is
+     * merely sloppy; on Windows renaming a file another handle is writing
+     * fails outright with EPERM.
+     */
+    this._tmpSuffix = `${process.pid}.${randomBytes(4).toString('hex')}`;
   }
 
   get enabled() {
@@ -165,8 +176,10 @@ export class PageCache {
       return null;
     }
 
-    hit.a = Date.now(); // touch, so eviction sheds the least recently useful
-    this.#markDirty();
+    // Touch in memory only. This improves eviction order, but it is not worth
+    // a disk write on every read -- and a write per read multiplies the chance
+    // of colliding with anything else touching the file.
+    hit.a = Date.now();
     return hit.t;
   }
 
@@ -195,6 +208,7 @@ export class PageCache {
   }
 
   #markDirty() {
+    if (this._closed) return;
     this._dirty = true;
     if (this._timer) return;
     this._timer = setTimeout(() => {
@@ -212,6 +226,13 @@ export class PageCache {
    * and no other user on the machine can read it.
    */
   async flush() {
+    // Cancel any pending debounce first. Otherwise a manual flush leaves a
+    // timer armed that fires later, after the caller believed it was done.
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+
     if (!this._dirty || !this._file || !this._entries) return;
     this._dirty = false;
 
@@ -220,7 +241,7 @@ export class PageCache {
       entries: Object.fromEntries(this._entries)
     });
 
-    const tmp = `${this._file}.${process.pid}.tmp`;
+    const tmp = `${this._file}.${this._tmpSuffix}.tmp`;
     try {
       await fsp.mkdir(this.dir, { recursive: true, mode: 0o700 });
       await fsp.writeFile(tmp, payload, { mode: 0o600 });
@@ -230,6 +251,21 @@ export class PageCache {
       this.log(`Could not write page cache: ${error.message}`);
       await fsp.rm(tmp, { force: true }).catch(() => {});
     }
+  }
+
+  /**
+   * Write anything outstanding and stop scheduling further writes.
+   *
+   * Without this, a cache whose owner has gone away can still fire a queued
+   * write half a second later and recreate a directory that was just deleted.
+   */
+  async close() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
+    }
+    await this.flush();
+    this._closed = true;
   }
 
   /** Delete everything for the signed-in account. Used by sign-out and the CLI. */
@@ -290,11 +326,21 @@ export async function purgeAllCaches(config) {
 
   let removed = 0;
   for (const file of files) {
-    if (!/^pages-[0-9a-f]{16}\.json$/.test(file)) continue;
-    await fsp.rm(path.join(dir, file), { force: true }).catch(() => {});
-    removed += 1;
+    // Both finished caches and any half-written temp file from an interrupted
+    // flush. Leaving a .tmp behind would mean fragments of note text surviving
+    // a sign-out, and would stop the directory being removed.
+    const isCache = /^pages-[0-9a-f]{16}\.json$/.test(file);
+    const isTemp = /^pages-[0-9a-f]{16}\.json\.[0-9]+\.[0-9a-f]+\.tmp$/.test(file);
+    if (!isCache && !isTemp) continue;
+
+    await fsp.rm(path.join(dir, file), { force: true, maxRetries: 3, retryDelay: 50 }).catch(
+      () => {}
+    );
+    if (isCache) removed += 1;
   }
 
+  // Best effort: on Windows the directory handle can linger a moment after the
+  // files are gone. The files are what matter, so a failure here is not one.
   await fsp.rmdir(dir).catch(() => {});
   return { removed };
 }

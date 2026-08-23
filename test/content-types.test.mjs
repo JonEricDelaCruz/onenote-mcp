@@ -9,6 +9,8 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+import { listTools as rpcListTools } from './rpc-client.mjs';
 import zlib from 'node:zlib';
 import { htmlToText, extractResources } from '../src/html.mjs';
 import { extractPdfText } from '../src/pdf.mjs';
@@ -188,45 +190,15 @@ describe('PDF text extraction', () => {
 
 describe('images are handed to the model, not OCR-ed', () => {
   test('getPage advertises image support and a way to opt out', async () => {
-    const { spawn } = await import('node:child_process');
-    const server = new URL('../onenote-mcp.mjs', import.meta.url).pathname;
-
-    const tools = await new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [server], {
-        env: {
-          ...process.env,
-          ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
-          ONENOTE_SKIP_DOTENV: '1'
-        },
-        stdio: ['pipe', 'pipe', 'pipe']
-      });
-      let out = '';
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL');
-        reject(new Error('timeout'));
-      }, 12000);
-      child.stdout.on('data', (c) => (out += c));
-      child.on('close', () => {
-        clearTimeout(timer);
-        const line = out.split('\n').find((l) => l.trim());
-        resolve(JSON.parse(line).result.tools);
-      });
-      child.stdin.write(
-        `${JSON.stringify({
-          jsonrpc: '2.0',
-          id: 1,
-          method: 'tools/list',
-          params: {
-            _meta: {
-              'io.modelcontextprotocol/protocolVersion': '2026-07-28',
-              'io.modelcontextprotocol/clientInfo': { name: 't', version: '1' },
-              'io.modelcontextprotocol/clientCapabilities': {}
-            }
-          }
-        })}\n`
-      );
-      setTimeout(() => child.stdin.end(), 900);
+    // fileURLToPath, deliberately: reading the path straight off the URL
+    // object yields a leading-slash drive path on Windows, which cannot be
+    // spawned. See the portability guard in efficiency.test.mjs.
+    const tools = await rpcListTools(fileURLToPath(new URL('../onenote-mcp.mjs', import.meta.url)), {
+      ...process.env,
+      ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
+      ONENOTE_SKIP_DOTENV: '1'
     });
+
 
     const getPage = tools.find((t) => t.name === 'getPage');
     const props = getPage.inputSchema.properties;

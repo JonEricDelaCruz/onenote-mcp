@@ -8,7 +8,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { listTools as rpcListTools } from './rpc-client.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { OneNoteClient } from '../src/onenote.mjs';
@@ -23,30 +23,10 @@ const META = {
 };
 
 function listTools() {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SERVER], {
-      env: {
-        ...process.env,
-        ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
-        ONENOTE_SKIP_DOTENV: '1'
-      },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    let out = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('timeout'));
-    }, 12000);
-    child.stdout.on('data', (c) => (out += c));
-    child.on('close', () => {
-      clearTimeout(timer);
-      const line = out.split('\n').find((l) => l.trim());
-      resolve(JSON.parse(line).result.tools);
-    });
-    child.stdin.write(
-      `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: { _meta: META } })}\n`
-    );
-    setTimeout(() => child.stdin.end(), 900);
+  return rpcListTools(SERVER, {
+    ...process.env,
+    ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
+    ONENOTE_SKIP_DOTENV: '1'
   });
 }
 
@@ -258,5 +238,53 @@ describe('images are offered, not charged for', () => {
     assert.equal(imageCount, 3);
     assert.equal(calls.resources, 0, 'counting must not fetch image bytes');
     assert.equal(calls.content, 1, 'and must reuse the cached page HTML');
+  });
+});
+
+describe('portability guards', () => {
+  /**
+   * These are the mistakes that pass on macOS and Linux and fail only on
+   * Windows, which means they are found by CI rather than by writing them --
+   * an expensive way to learn. Catch them locally instead.
+   */
+  const sourceFiles = async () => {
+    const { readdir, readFile } = await import('node:fs/promises');
+    const root = path.join(__dirname, '..');
+    const out = [];
+
+    for (const dir of ['.', 'src', 'test', 'scripts']) {
+      const full = path.join(root, dir);
+      for (const name of await readdir(full)) {
+        if (!name.endsWith('.mjs')) continue;
+        out.push({ name: path.join(dir, name), text: await readFile(path.join(full, name), 'utf8') });
+      }
+    }
+    return out;
+  };
+
+  test('no file URL is converted with .pathname', async () => {
+    // `new URL(...).pathname` yields "/C:/Users/..." on Windows, which cannot
+    // be spawned, imported, or opened. fileURLToPath() is the correct tool.
+    for (const file of await sourceFiles()) {
+      // Comments are stripped first: prose explaining the hazard should not
+      // count as committing it.
+      const code = file.text.replace(/\/\/.*$/gm, '');
+      assert.ok(
+        !/\)\s*\.pathname/.test(code),
+        `${file.name} reads .pathname off a URL; use fileURLToPath() instead`
+      );
+    }
+  });
+
+  test('no test waits a fixed time for a spawned server', async () => {
+    // Sleeping for a guessed number of milliseconds is a bet on how fast the
+    // machine is. CI runners are slow, so the bet loses there and nowhere else.
+    for (const file of await sourceFiles()) {
+      if (!file.name.startsWith('test')) continue;
+      assert.ok(
+        !/setTimeout\(\(\) => child\.stdin\.end\(\)/.test(file.text),
+        `${file.name} closes stdin on a timer; wait for the response instead`
+      );
+    }
   });
 });

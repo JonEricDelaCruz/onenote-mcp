@@ -12,7 +12,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { converse as rpcConverse } from './rpc-client.mjs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { OneNoteClient } from '../src/onenote.mjs';
@@ -27,40 +27,14 @@ const META = {
 };
 
 function converse(messages) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [SERVER], {
-      env: {
-        ...process.env,
-        ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
-        ONENOTE_SKIP_DOTENV: '1',
-        ONENOTE_TOKEN_CACHE: path.join(__dirname, '..', '.test-cache', 'tc.json')
-      },
-      stdio: ['pipe', 'pipe', 'pipe']
-    });
-    let out = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('timeout'));
-    }, 12000);
-    child.stdout.on('data', (c) => (out += c));
-    child.on('close', () => {
-      clearTimeout(timer);
-      resolve(
-        out
-          .split('\n')
-          .filter((l) => l.trim())
-          .map((l) => {
-            try {
-              return JSON.parse(l);
-            } catch {
-              return {};
-            }
-          })
-      );
-    });
-    for (const m of messages) child.stdin.write(`${JSON.stringify(m)}\n`);
-    setTimeout(() => child.stdin.end(), 1000);
-  });
+  return rpcConverse(SERVER, messages, {
+    env: {
+      ...process.env,
+      ONENOTE_CLIENT_ID: '00000000-0000-0000-0000-000000000001',
+      ONENOTE_SKIP_DOTENV: '1',
+      ONENOTE_TOKEN_CACHE: path.join(__dirname, '..', '.test-cache', 'tc.json')
+    }
+  }).then((r) => r.responses);
 }
 
 describe('getPage returns readable content', () => {
