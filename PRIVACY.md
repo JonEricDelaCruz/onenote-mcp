@@ -8,7 +8,7 @@ all.
 
 This document explains exactly how, so you can verify it rather than trust it.
 
-Last updated: 2026-08-11 · Applies to: OneNote for Claude v2.1.0
+Last updated: 2026-08-11 · Applies to: OneNote for Claude v2.1.1
 
 ---
 

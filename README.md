@@ -230,7 +230,7 @@ It checks every layer — Node version, configuration, credentials, whether Micr
 ## Development
 
 ```bash
-npm test        # 181 tests, including end-to-end protocol tests
+npm test        # 183 tests, including end-to-end protocol tests
 npm run check   # syntax check
 npm run audit   # dependency advisories
 npm run bundle  # build the .mcpb
